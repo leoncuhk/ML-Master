@@ -1,0 +1,4 @@
+Your goal is to solve the Kaggle Titanic competition.
+You need to predict whether a passenger survived or not.
+The training data is in 'titanic/train.csv'.
+Your script must print the final validation accuracy to standard output in the following specific format: `Accuracy: [your_accuracy_score]`.

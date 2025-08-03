@@ -2,26 +2,31 @@ from typing import List, Dict, Any, Optional
 from .core import MCTSNode
 import google.generativeai as genai
 import re
+import time
+import random
+from google.api_core import exceptions
 
 class Reasoner:
     """
     Implements the Steerable Reasoning module.
     Interacts with a Gemini LLM and uses adaptive memory to guide the reasoning process.
+    This module is given a specific action (Draft, Debug, Improve) and generates a solution.
     """
     def __init__(self, api_key: str, model: str = "gemini-1.5-pro-latest"):
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model)
 
-    def construct_adaptive_memory(self, node: MCTSNode) -> str:
+    def _construct_adaptive_memory(self, node: MCTSNode) -> str:
         """
-        Constructs the adaptive memory from the parent and sibling nodes.
+        Constructs the adaptive memory from the parent and sibling nodes,
+        implementing the logic from Equation 7 of the ML-Master paper.
         """
         memory_parts = []
 
-        # 1. Add context from the parent node
+        # 1. Context from the immediate parent node (t-1)
         if node.parent:
             parent = node.parent
-            memory_parts.append("### Previous Attempt (Parent Node):\n")
+            memory_parts.append("### Context from Previous Attempt (Parent Node):\n")
             if parent.reasoning_insights:
                 memory_parts.append(f"**Reasoning:** {parent.reasoning_insights}\n")
             if parent.code:
@@ -31,70 +36,99 @@ class Reasoner:
             if parent.performance_metric is not None:
                 memory_parts.append(f"**Performance:** {parent.performance_metric}\n")
 
-        # 2. Add context from sibling nodes for contrastive signals
+        # 2. Context from sibling nodes (s in S_t) for contrastive signals
         if node.parent:
             siblings = [child for child in node.parent.children if child is not node]
             if siblings:
-                memory_parts.append("\n### Parallel Attempts (Sibling Nodes):\n")
+                memory_parts.append("\n### Context from Parallel Attempts (Sibling Nodes):\n")
                 for i, sibling in enumerate(siblings):
-                    memory_parts.append(f"--- Sibling {i+1} ---\n")
-                    if sibling.reasoning_insights:
-                        memory_parts.append(f"**Reasoning:** {sibling.reasoning_insights}\n")
-                    if sibling.performance_metric is not None:
-                        memory_parts.append(f"**Performance:** {sibling.performance_metric}\n")
+                    # Only include siblings that have been evaluated
+                    if sibling.visit_count > 0:
+                        memory_parts.append(f"--- Sibling Attempt {i+1} ---\n")
+                        if sibling.reasoning_insights:
+                            memory_parts.append(f"**Reasoning:** {sibling.reasoning_insights}\n")
+                        if sibling.performance_metric is not None:
+                            memory_parts.append(f"**Performance:** {sibling.performance_metric}\n")
+                        if sibling.has_bug:
+                            memory_parts.append(f"**Result:** This attempt resulted in a bug.\n")
+
+        if not memory_parts:
+            return "No previous attempts. This is the first draft."
 
         return "".join(memory_parts)
 
-    def generate_action(self, node: MCTSNode, task_description: str) -> Dict[str, Any]:
+    def generate_solution_for_action(self, node: MCTSNode, action: str, task_description: str) -> Dict[str, Any]:
         """
-        Generates an action (Draft, Debug, Improve) and the corresponding code/plan.
+        Generates a solution for a given action (Draft, Debug, Improve).
+        The reasoning process is steered by the adaptive memory.
+        Includes retry logic with exponential backoff for API calls.
         """
-        adaptive_memory = self.construct_adaptive_memory(node)
-        
-        prompt = f"""
-        You are an expert AI developer solving the Kaggle Titanic competition.
-        Your task is to write a complete, single Python script to perform the entire machine learning workflow.
+        adaptive_memory = self._construct_adaptive_memory(node)
 
-        **CONTEXT FROM PREVIOUS ATTEMPTS:**
+        prompt_template = f"""
+        You are an expert AI developer. Your goal is to solve a machine learning task by writing a complete, single Python script.
+
+        **TASK DESCRIPTION:**
+        {task_description}
+
+        **CONTEXT FROM PREVIOUS EXPLORATION (ADAPTIVE MEMORY):**
         {adaptive_memory}
 
-        **INSTRUCTIONS:**
-        1.  **Load Data**: Load the training data from 'titanic/train.csv' using pandas.
-        2.  **Preprocess & Feature Engineer**: Handle missing values (e.g., for 'Age'), convert categorical features (like 'Sex' and 'Embarked') into numerical format. You can also create new features if you think they are useful.
-        3.  **Split Data**: Split the 'train.csv' data into a training set and a validation set (e.g., 80% train, 20% validation). Use `sklearn.model_selection.train_test_split`.
-        4.  **Train Model**: Choose a classification model (e.g., LogisticRegression, RandomForestClassifier), and train it on your training set.
-        5.  **Evaluate**: Predict on the validation set and calculate the accuracy score.
-        6.  **Output**: Your script **MUST** print the final validation accuracy to standard output in the following specific format: `Accuracy: [your_accuracy_score]` where `[your_accuracy_score]` is a float (e.g., `Accuracy: 0.785`). This is the only way your performance can be measured.
+        **YOUR ASSIGNED ACTION: {action}**
 
-        **YOUR ACTION:**
-        Based on the context, decide on your action:
-        - **Draft**: Write the first version of the script.
-        - **Debug**: Fix errors in the previous script.
-        - **Improve**: Enhance the performance of the working script.
+        **INSTRUCTIONS:**
+        Based on the task description, the adaptive memory, and your assigned action, please provide your reasoning and the full Python code.
+
+        - If the action is **Draft**: Write the first version of the script from scratch, keeping the task description in mind.
+        - If the action is **Debug**: Analyze the provided code and execution feedback from the parent node. Identify the bug and provide a corrected, complete script.
+        - If the action is **Improve**: Analyze the parent node's solution. Propose a specific enhancement (e.g., change model, add feature engineering, tune hyperparameters) and provide the complete, improved script.
 
         **RESPONSE FORMAT:**
-        **Action**: [Your chosen action: Draft, Debug, or Improve]
-        **Reasoning**: [Your step-by-step thinking process and plan for the script]
-        **Code**: [The full Python script that accomplishes all steps above]
+        **Reasoning**: [Your step-by-step thinking process for the assigned action. Explain how you are using the adaptive memory to inform your decisions.]
+        **Code**: [The full Python script.]
         """
 
-        response = self.model.generate_content(prompt)
-        parsed_response = self._parse_llm_response(response.text)
-        return parsed_response
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = self.model.generate_content(prompt_template)
+                return self._parse_llm_response(response.text)
+            except exceptions.ResourceExhausted as e:
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + random.random()
+                    print(f"Rate limit exceeded. Retrying in {wait_time:.2f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    raise e  # Re-raise the exception after the last attempt
+        
+        # This part should not be reachable if the loop raises an exception
+        return {
+            "Reasoning": "Failed to get a response from the LLM after multiple retries.",
+            "Code": "# LLM call failed repeatedly due to rate limiting or other issues."
+        }
+
 
     def _parse_llm_response(self, response_text: str) -> Dict[str, Any]:
         """
-        Parses the LLM's response to extract the action, reasoning, and code.
+        Parses the LLM's response to extract the reasoning and code.
         """
         try:
-            action = re.search(r"\*\*Action\*\*:\s*(Draft|Debug|Improve)", response_text).group(1)
-            reasoning = re.search(r"\*\*Reasoning\*\*:\s*([\s\S]*?)\*\*Code\*\*:", response_text).group(1).strip()
-            code = re.search(r"\*\*Code\*\*:\s*```python\n([\s\S]*?)```", response_text).group(1).strip()
-            return {"Action": action, "Reasoning": reasoning, "Code": code}
-        except AttributeError:
+            # Reasoning is between "**Reasoning**:" and "**Code**:")
+            reasoning_match = re.search(r"\*\*Reasoning\*\*:\s*([\s\S]*?)(?=\n\*\*Code\*\*:)", response_text)
+            reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+
+            # Code is inside the python block
+            code_match = re.search(r"\*\*Code\*\*:\s*```python\n([\s\S]*?)```", response_text)
+            code = code_match.group(1).strip() if code_match else ""
+
+            if not code:
+                raise AttributeError("Code block not found in response.")
+
+            return {"Reasoning": reasoning, "Code": code}
+        except AttributeError as e:
             # Fallback if parsing fails
             return {
-                "Action": "Debug",
-                "Reasoning": "Failed to parse the LLM response. The format might be incorrect.",
-                "Code": "# Parsing failed, please check the LLM output format.\nprint('Error: Could not parse LLM response.')"
+                "Reasoning": f"Failed to parse the LLM response: {e}. The format might be incorrect.",
+                "Code": f"# Parsing failed, please check the LLM output format.\nprint('Error: Could not parse LLM response.')\n# Raw response:\n# {response_text}"
             }
+
